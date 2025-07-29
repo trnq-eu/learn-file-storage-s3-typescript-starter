@@ -1,9 +1,10 @@
 import { getBearerToken, validateJWT } from "../auth";
 import { respondWithJSON } from "./json";
-import { getVideo } from "../db/videos";
+import { getVideo, updateVideo } from "../db/videos";
 import type { ApiConfig } from "../config";
 import type { BunRequest } from "bun";
-import { BadRequestError, NotFoundError } from "./errors";
+import { BadRequestError, NotFoundError, UserForbiddenError } from "./errors";
+
 
 type Thumbnail = {
   data: ArrayBuffer;
@@ -61,5 +62,41 @@ export async function handlerUploadThumbnail(cfg: ApiConfig, req: BunRequest) {
 
   const mediaType = file.type;
 
-  return respondWithJSON(200, null);
+  const arrayBuffer = await file.arrayBuffer();
+
+  // convert arrayBuffer to Buffer.from()
+  const buffer = Buffer.from(arrayBuffer);
+
+  // convert buffer to base64
+  const base64Data = buffer.toString("base64");
+
+  // get video
+  const video = getVideo(cfg.db, videoId);
+
+  if (!video) {
+    throw new NotFoundError("Couldn't find video");
+  }
+
+  // check ownership
+  if (video.userID != userID) {
+    throw new UserForbiddenError("Wrong user");
+  }
+
+  // save thumbnail
+  videoThumbnails.set(videoId, {
+    data: arrayBuffer,
+    mediaType
+  })
+
+  // generate thumbnail url
+  const thumbnailURL =  `http://localhost:${cfg.port}/api/thumbnails/${videoId}`
+
+  // update the video's metadata
+  video.thumbnailURL = thumbnailURL;
+
+  // write changes to database
+  updateVideo(cfg.db, video);
+
+
+  return respondWithJSON(200, video);
 }
