@@ -70,6 +70,8 @@ export async function handlerUploadThumbnail(cfg: ApiConfig, req: BunRequest) {
   // convert buffer to base64
   const base64Data = buffer.toString("base64");
 
+  const dataURL = `data:${mediaType};base64,${base64Data}`;
+
   // get video
   const video = getVideo(cfg.db, videoId);
 
@@ -82,17 +84,12 @@ export async function handlerUploadThumbnail(cfg: ApiConfig, req: BunRequest) {
     throw new UserForbiddenError("Wrong user");
   }
 
-  // save thumbnail
-  videoThumbnails.set(videoId, {
-    data: arrayBuffer,
-    mediaType
-  })
+
 
   // generate thumbnail url
-  const thumbnailURL =  `http://localhost:${cfg.port}/api/thumbnails/${videoId}`
+  video.thumbnailURL =  dataURL;
 
-  // update the video's metadata
-  video.thumbnailURL = thumbnailURL;
+ 
 
   // write changes to database
   updateVideo(cfg.db, video);
