@@ -1,10 +1,11 @@
 import { getBearerToken, validateJWT } from "../auth";
+import { getAssetDiskPath, getAssetURL, mediaTypeToExt } from "./assets";
 import { respondWithJSON } from "./json";
 import { getVideo, updateVideo } from "../db/videos";
 import type { ApiConfig } from "../config";
 import type { BunRequest } from "bun";
 import { BadRequestError, NotFoundError, UserForbiddenError } from "./errors";
-
+import { randomBytes } from "crypto";
 
 type Thumbnail = {
   data: ArrayBuffer;
@@ -61,35 +62,36 @@ export async function handlerUploadThumbnail(cfg: ApiConfig, req: BunRequest) {
   }
 
   const mediaType = file.type;
+  if (!mediaType) {
+    throw new BadRequestError("Missing Content-Type for thumbnail");
+  }
 
-  const arrayBuffer = await file.arrayBuffer();
+  if (mediaType != "image/jpeg" && mediaType != "image/png") {
+    throw new BadRequestError("File format not accepted");
+  }
 
-  // convert arrayBuffer to Buffer.from()
-  const buffer = Buffer.from(arrayBuffer);
+  const extension = mediaTypeToExt(mediaType)
+  const randomVideoId = randomBytes(32).toString("base64url")
 
-  // convert buffer to base64
-  const base64Data = buffer.toString("base64");
+  const fileName =  `${randomVideoId}${extension}`;
 
-  const dataURL = `data:${mediaType};base64,${base64Data}`;
+  const assetDiskPath = getAssetDiskPath(cfg,fileName);
+
+  await Bun.write(assetDiskPath, file);
+
+  const urlPath = getAssetURL(cfg, fileName);
 
   // get video
   const video = getVideo(cfg.db, videoId);
-
   if (!video) {
     throw new NotFoundError("Couldn't find video");
   }
-
-  // check ownership
-  if (video.userID != userID) {
-    throw new UserForbiddenError("Wrong user");
+  if (video.userID !== userID) {
+    throw new UserForbiddenError("Not authorized to update this video");
   }
 
+  video.thumbnailURL = urlPath
 
-
-  // generate thumbnail url
-  video.thumbnailURL =  dataURL;
-
- 
 
   // write changes to database
   updateVideo(cfg.db, video);
