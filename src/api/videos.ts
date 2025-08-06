@@ -8,9 +8,8 @@ import { getVideo, updateVideo } from "../db/videos";
 import { BadRequestError, UserForbiddenError } from "./errors";
 import { randomBytes } from "crypto";
 import { getAssetDiskPath, getAssetURL, mediaTypeToExt } from "./assets";
-import { uploadVideoToS3 } from "../s3";
+import { uploadVideoToS3, generatePresignedURL } from "../s3";
 import { getVideoAspectRatio } from "../utility"
-
 
 // Regex to match UUID (v1-v5, standard format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx)
 const UUID_REGEX =
@@ -69,6 +68,18 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   const tempFilePath = path.join("/tmp", `${videoId}.mp4`);
   await Bun.write(tempFilePath, videoFile);
 
+  // Process video to move moov atom to beginning for "fast start"
+
+  let processedFilePath: string;
+  try {
+    processedFilePath = await processVideoForFastStart(tempFilePath)
+  } catch (err) {
+    await rm(tempFilePath, { force: true });
+    return respondWithJSON(500, {
+    error: `Video processing failed: ${err instanceof Error ? err.message : 'Unknown error'}`
+    });
+  }
+
   // get aspect ratio using ffprobe
   let aspectRatio;
 
@@ -84,17 +95,57 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   // create S3 key with aspect ratio prefix
   const key = `${aspectRatio}/${videoId}.mp4`
 
-  await uploadVideoToS3(cfg, key, tempFilePath, "video/mp4");
+  await uploadVideoToS3(cfg, key, processedFilePath, "video/mp4");
 
   // const randomVideoId = randomBytes(32).toString("base64url")
 
   const videoURL =  `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${key}`;
 
-  video.videoURL = videoURL;
-
+  video.videoURL = key;
   await updateVideo(cfg.db, video);
 
   await rm(tempFilePath, { force: true });
+  await rm(processedFilePath, { force: true });
 
   return respondWithJSON(200, { videoURL});
+}
+
+export async function processVideoForFastStart(inputFilePath: string) {
+  const outputFilePath = `${inputFilePath}.processed.mp4`;
+
+  const args = [
+    "-i",
+    inputFilePath,
+    "-movflags", "faststart",
+    "-map_metadata", "0",
+    "-codec", "copy",
+    "-f", "mp4",
+    outputFilePath
+  ];
+
+  const process = Bun.spawn({
+    cmd: ["ffmpeg", ...args],
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+
+  const stderr = await new Response(process.stderr).text();
+  const exitCode = await process.exited;
+
+  if (exitCode != 0) {
+    throw new Error(`FFmpeg failed: ${stderr}`);
+  }
+
+  return outputFilePath;
+
+}
+
+export function dbVideoToSignedVideo(cfg: ApiConfig, video: any) {
+  const s3Key = video.videoURL;
+  const presignedLink = generatePresignedURL(cfg, s3Key, 60);
+
+  return {
+    ...video,
+    videoURL: presignedLink
+  };
 }
