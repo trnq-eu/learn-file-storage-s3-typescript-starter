@@ -104,10 +104,14 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   video.videoURL = key;
   await updateVideo(cfg.db, video);
 
+  const signedVideo = dbVideoToSignedVideo(cfg, video);
+
   await rm(tempFilePath, { force: true });
   await rm(processedFilePath, { force: true });
 
-  return respondWithJSON(200, { videoURL});
+  //   return respondWithJSON(200, { video });
+
+  return respondWithJSON(200, signedVideo);
 }
 
 export async function processVideoForFastStart(inputFilePath: string) {
