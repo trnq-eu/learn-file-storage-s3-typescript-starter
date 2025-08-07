@@ -4,7 +4,7 @@ import { createVideo, deleteVideo, getVideo, getVideos } from "../db/videos";
 import { respondWithJSON } from "./json";
 import { BadRequestError, NotFoundError, UserForbiddenError } from "./errors";
 import type { BunRequest } from "bun";
-import { dbVideoToSignedVideo } from "./videos"
+import { dbVideoToSignedVideo } from "./video-response"
 
 export async function handlerVideoMetaCreate(cfg: ApiConfig, req: Request) {
   const token = getBearerToken(req.headers);

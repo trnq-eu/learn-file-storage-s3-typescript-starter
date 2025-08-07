@@ -10,6 +10,7 @@ import { randomBytes } from "crypto";
 import { getAssetDiskPath, getAssetURL, mediaTypeToExt } from "./assets";
 import { uploadVideoToS3, generatePresignedURL } from "../s3";
 import { getVideoAspectRatio } from "../utility"
+import { dbVideoToSignedVideo } from "./video-response"
 
 // Regex to match UUID (v1-v5, standard format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx)
 const UUID_REGEX =
@@ -144,12 +145,3 @@ export async function processVideoForFastStart(inputFilePath: string) {
 
 }
 
-export function dbVideoToSignedVideo(cfg: ApiConfig, video: any) {
-  const s3Key = video.videoURL;
-  const presignedLink = generatePresignedURL(cfg, s3Key, 60);
-
-  return {
-    ...video,
-    videoURL: presignedLink
-  };
-}
