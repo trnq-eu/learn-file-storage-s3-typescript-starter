@@ -1,5 +1,4 @@
 import { spawn } from 'bun';
-import { generatePresignedURL } from "./s3";
 import { type ApiConfig } from "./config";
 
 
