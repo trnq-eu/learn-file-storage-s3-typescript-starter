@@ -1,147 +1,144 @@
-import { respondWithJSON } from "./json";
 import { rm } from "fs/promises";
 import path from "path";
+import { getBearerToken, validateJWT } from "../auth";
+import { getVideo, updateVideo, type Video } from "../db/videos";
+import { respondWithJSON } from "./json";
+import { uploadVideoToS3, generatePresignedURL } from "../s3";
+import { BadRequestError, NotFoundError, UserForbiddenError } from "./errors";
+
 import { type ApiConfig } from "../config";
 import type { BunRequest } from "bun";
-import { getBearerToken, validateJWT } from "../auth";
-import { getVideo, updateVideo } from "../db/videos";
-import { BadRequestError, UserForbiddenError } from "./errors";
-import { randomBytes } from "crypto";
-import { getAssetDiskPath, getAssetURL, mediaTypeToExt } from "./assets";
-import { uploadVideoToS3, generatePresignedURL } from "../s3";
-import { getVideoAspectRatio } from "../utility"
-import { dbVideoToSignedVideo } from "./video-response"
-
-// Regex to match UUID (v1-v5, standard format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx)
-const UUID_REGEX =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-function isValidUUID(id: string): boolean {
-  return UUID_REGEX.test(id);
-}
 
 export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   const MAX_UPLOAD_SIZE = 1 << 30;
-  const { videoId } = req.params as { videoId?: string}
 
+  const { videoId } = req.params as { videoId?: string };
   if (!videoId) {
-    return respondWithJSON(400, {error: "Missing videoId parameter"});
+    throw new BadRequestError("Invalid video ID");
   }
 
-  if (!isValidUUID(videoId)) {
-    return respondWithJSON(400, {error: "Invalid videoId: must be a valid UUID"});
-  }
+  const token = getBearerToken(req.headers);
+  const userID = validateJWT(token, cfg.jwtSecret);
 
-  const token = getBearerToken(req.headers)
-  const userId = validateJWT(token, cfg.jwtSecret);
-
-  const video = await getVideo(cfg.db, videoId);
-
+  const video = getVideo(cfg.db, videoId);
   if (!video) {
-    return respondWithJSON(400, "Video not found")
+    throw new NotFoundError("Couldn't find video");
+  }
+  if (video.userID !== userID) {
+    throw new UserForbiddenError("Not authorized to update this video");
   }
 
-  if (userId != video.userID) {
-    throw new UserForbiddenError("User is not video owner.");
+  const formData = await req.formData();
+  const file = formData.get("video");
+  if (!(file instanceof File)) {
+    throw new BadRequestError("Video file missing");
   }
-
-  const formData = await req.formData()
-
-  const videoFile = formData.get("video")
-
-  if (!(videoFile instanceof File)) {
-    throw new BadRequestError("Thumbnail file missing");
- }
-
-  if (videoFile.size > MAX_UPLOAD_SIZE) {
-    throw new BadRequestError("File exceeds size limit (1GB)")
+  if (file.size > MAX_UPLOAD_SIZE) {
+    throw new BadRequestError("File exceeds size limit (1GB)");
   }
-
-  const mediaType = videoFile.type;
-
-  if (videoFile.type != mediaType) {
+  if (file.type !== "video/mp4") {
     throw new BadRequestError("Invalid file type, only MP4 is allowed");
-
   }
-
-  const extension = mediaTypeToExt(mediaType)
 
   const tempFilePath = path.join("/tmp", `${videoId}.mp4`);
-  await Bun.write(tempFilePath, videoFile);
+  await Bun.write(tempFilePath, file);
 
-  // Process video to move moov atom to beginning for "fast start"
+  const aspectRatio = await getVideoAspectRatio(tempFilePath);
+  const processedFilePath = await processVideoForFastStart(tempFilePath);
 
-  let processedFilePath: string;
-  try {
-    processedFilePath = await processVideoForFastStart(tempFilePath)
-  } catch (err) {
-    await rm(tempFilePath, { force: true });
-    return respondWithJSON(500, {
-    error: `Video processing failed: ${err instanceof Error ? err.message : 'Unknown error'}`
-    });
-  }
-
-  // get aspect ratio using ffprobe
-  let aspectRatio;
-
-  try {
-    aspectRatio = await getVideoAspectRatio(tempFilePath)
-    console.log("Aspect ratio detected:", aspectRatio);  // <-- Add this line
-
-  } catch (err) {
-    await rm(tempFilePath, {force: true});
-    return respondWithJSON(500, { error: `Failed to analyze video: ${err instanceof Error ? err.message : 'Unknown error'}`});
-  }
-
-  // create S3 key with aspect ratio prefix
-  const key = `${aspectRatio}/${videoId}.mp4`
-
+  const key = `${aspectRatio}/${videoId}.mp4`;
   await uploadVideoToS3(cfg, key, processedFilePath, "video/mp4");
 
-  // const randomVideoId = randomBytes(32).toString("base64url")
+  video.videoURL = `${key}`;
+  updateVideo(cfg.db, video);
 
-  const videoURL =  `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${key}`;
+  await Promise.all([
+    rm(tempFilePath, { force: true }),
+    rm(`${tempFilePath}.processed.mp4`, { force: true }),
+  ]);
+  return respondWithJSON(200, video);
+}
 
-  video.videoURL = key;
-  await updateVideo(cfg.db, video);
+export async function getVideoAspectRatio(filePath: string) {
+  const process = Bun.spawn(
+    [
+      "ffprobe",
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-show_entries",
+      "stream=width,height",
+      "-of",
+      "json",
+      filePath,
+    ],
+    {
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
 
-  const signedVideo = dbVideoToSignedVideo(cfg, video);
+  const outputText = await new Response(process.stdout).text();
+  const errorText = await new Response(process.stderr).text();
 
-  await rm(tempFilePath, { force: true });
-  await rm(processedFilePath, { force: true });
+  const exitCode = await process.exited;
 
-  //   return respondWithJSON(200, { video });
+  if (exitCode !== 0) {
+    throw new Error(`ffprobe error: ${errorText}`);
+  }
 
-  return respondWithJSON(200, signedVideo);
+  const output = JSON.parse(outputText);
+  if (!output.streams || output.streams.length === 0) {
+    throw new Error("No video streams found");
+  }
+
+  const { width, height } = output.streams[0];
+
+  return width === Math.floor(16 * (height / 9))
+    ? "landscape"
+    : height === Math.floor(16 * (width / 9))
+      ? "portrait"
+      : "other";
 }
 
 export async function processVideoForFastStart(inputFilePath: string) {
-  const outputFilePath = `${inputFilePath}.processed.mp4`;
+  const processedFilePath = `${inputFilePath}.processed.mp4`;
 
-  const args = [
-    "-i",
-    inputFilePath,
-    "-movflags", "faststart",
-    "-map_metadata", "0",
-    "-codec", "copy",
-    "-f", "mp4",
-    outputFilePath
-  ];
+  const process = Bun.spawn(
+    [
+      "ffmpeg",
+      "-i",
+      inputFilePath,
+      "-movflags",
+      "faststart",
+      "-map_metadata",
+      "0",
+      "-codec",
+      "copy",
+      "-f",
+      "mp4",
+      processedFilePath,
+    ],
+    { stderr: "pipe" },
+  );
 
-  const process = Bun.spawn({
-    cmd: ["ffmpeg", ...args],
-    stdout: "pipe",
-    stderr: "pipe"
-  });
-
-  const stderr = await new Response(process.stderr).text();
+  const errorText = await new Response(process.stderr).text();
   const exitCode = await process.exited;
 
-  if (exitCode != 0) {
-    throw new Error(`FFmpeg failed: ${stderr}`);
+  if (exitCode !== 0) {
+    throw new Error(`FFmpeg error: ${errorText}`);
   }
 
-  return outputFilePath;
-
+  return processedFilePath;
 }
 
+export async function dbVideoToSignedVideo(cfg: ApiConfig, video: Video) {
+  if (!video.videoURL) {
+    return video;
+  }
+
+  video.videoURL = await generatePresignedURL(cfg, video.videoURL, 5 * 60);
+
+  return video;
+}
